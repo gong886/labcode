@@ -73,6 +73,10 @@ best_fit_init_memmap(struct Page *base, size_t n) {
     for (; p != base + n; p ++) {
         assert(PageReserved(p));
         /*LAB2 请补充你在lab2中的代码 */ 
+        // 清空当前页框的标志和属性信息，并将页框的引用计数设置为0
+        p->flags = 0;           // 清除标志位
+        p->property = 0;        // 非首页的属性设为0
+        set_page_ref(p, 0);     // 设置引用计数为0
         
     }
     base->property = n;
@@ -85,6 +89,12 @@ best_fit_init_memmap(struct Page *base, size_t n) {
         while ((le = list_next(le)) != &free_list) {
             struct Page* page = le2page(le, page_link);
             /*LAB2 请补充你在lab2中的代码 */ 
+            if (base < page) {
+                list_add_before(le, &(base->page_link));  // 在合适位置插入
+                break;
+            } else if (list_next(le) == &free_list) {
+                list_add(le, &(base->page_link));  // 插入到链表末尾
+            }
 
         }
     }
@@ -100,28 +110,38 @@ best_fit_alloc_pages(size_t n) {
     list_entry_t *le = &free_list;
     size_t min_size = nr_free + 1;
     /*LAB2 请补充你在lab2中的代码*/ 
-
+   list_entry_t *best_le = NULL;  // 记录最佳位置的链表项
+    
     while ((le = list_next(le)) != &free_list) {
         struct Page *p = le2page(le, page_link);
-        if (p->property >= n) {
+        if (p->property >= n && p->property < min_size) {
+            // 找到更小的合适块，更新最小值和最佳位置
+            min_size = p->property;
+            best_le = le;
             page = p;
-            break;
         }
     }
 
+    // 如果找到了合适的页块
     if (page != NULL) {
         list_entry_t* prev = list_prev(&(page->page_link));
-        list_del(&(page->page_link));
+        list_del(&(page->page_link));  // 从链表中删除该页
+        
+        // 如果块比需要的大，分割块
         if (page->property > n) {
             struct Page *p = page + n;
-            p->property = page->property - n;
-            SetPageProperty(p);
+            p->property = page->property - n;  // 设置剩余页的属性
+            SetPageProperty(p);  // 标记为有属性
+            
+            // 将剩余部分重新插入到链表中
             list_add(prev, &(p->page_link));
         }
-        nr_free -= n;
-        ClearPageProperty(page);
+        
+        nr_free -= n;  // 减少空闲页数量
+        ClearPageProperty(page);  // 清除页属性标志（表示已分配）
     }
-    return page;
+    
+    return page; 
 }
 
 static void
@@ -134,6 +154,10 @@ best_fit_free_pages(struct Page *base, size_t n) {
         set_page_ref(p, 0);
     }
     /*LAB2 请补充你在lab2中的代码*/
+
+    base->property = n;      // 设置基础页的属性为释放的页数
+    SetPageProperty(base);   // 标记基础页具有属性（空闲状态）
+    nr_free += n;           // 增加空闲页数量
 
     if (list_empty(&free_list)) {
         list_add(&free_list, &(base->page_link));
@@ -154,8 +178,15 @@ best_fit_free_pages(struct Page *base, size_t n) {
     if (le != &free_list) {
         p = le2page(le, page_link);
         /*LAB2 请补充你在lab2中的代码*/
-        
+        if (p + p->property == base) {  // 检查是否连续
+            p->property += base->property;  // 合并块
+            ClearPageProperty(base);  // 清除基础页属性
+            list_del(&(base->page_link));  // 从链表中删除基础页
+            base = p;  // 更新基础页指针为合并后的块
+        }
+
     }
+
 
     le = list_next(&(base->page_link));
     if (le != &free_list) {

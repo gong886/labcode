@@ -111,7 +111,27 @@ void interrupt_handler(struct trapframe *tf)
         // clear_csr(sip, SIP_STIP);
 
         /*LAB3 请补充你在lab3中的代码 */ 
+        
+        clock_set_next_event();
+
+        static int printed_num = 0;
+
+        // 递增 ticks 并检查是否达到阈值
+        ticks++;
+        if (ticks % TICK_NUM == 0) {
+            // 每 100 次 ticks 打印一次 
+            print_ticks();
+            printed_num++;
+
+            // 打印达到 10 次时关机 
+            if (printed_num % 10 == 0) {
+                // 调用 SBI 提供的关机函数
+                sbi_shutdown();
+                   
+            }
+        }
         break;
+        
     case IRQ_H_TIMER:
         cprintf("Hypervisor software interrupt\n");
         break;
