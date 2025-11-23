@@ -195,6 +195,31 @@ void proc_run(struct proc_struct *proc)
          *   lsatp():                   Modify the value of satp register
          *   switch_to():              Context switching between two processes
          */
+        // 保存中断状态并禁止中断
+        unsigned long irq_flag;
+        local_intr_save(irq_flag);
+
+        struct proc_struct *prev = current;
+
+        // 切换 current 指针到新的 proc
+        current = proc;
+
+        /*
+         * 加载进程的页表基地址到 satp (RISC-V)
+         * lsatp() 应该会把 proc->pgdir 写入 satp (你的环境中的实现)
+         */
+        lsatp(proc->pgdir);
+
+        /*
+         * 实际的上下文切换（会保存 old context 到 prev->context，
+         * 并恢复 proc->context）
+         */
+        switch_to(&prev->context, &proc->context);
+
+        // 还原中断状态
+        local_intr_restore(irq_flag);
+
+         
 
     }
 }
@@ -308,7 +333,7 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
         goto fork_out;
     }
     ret = -E_NO_MEM;
-    // LAB4:EXERCISE2 YOUR CODE
+    // LAB4:EXERCISE2 2312005
     /*
      * Some Useful MACROs, Functions and DEFINEs, you can use them in below implementation.
      * MACROs or Functions:
@@ -333,7 +358,58 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
     //    5. insert proc_struct into hash_list && proc_list
     //    6. call wakeup_proc to make the new child process RUNNABLE
     //    7. set ret vaule using child proc's pid
-    
+        /* 1. alloc_proc */
+    proc = alloc_proc();
+    if (proc == NULL) {
+        goto fork_out;
+    }
+
+    /* 2. setup_kstack */
+    if (setup_kstack(proc) < 0) {
+        ret = -E_NO_MEM;
+        goto bad_fork_cleanup_proc;
+    }
+
+    /* 3. copy_mm (share or duplicate mm) */
+    if (copy_mm(clone_flags, proc) < 0) {
+        ret = -E_NO_MEM;
+        goto bad_fork_cleanup_kstack;
+    }
+
+    /* 4. copy_thread: setup trapframe/context */
+    copy_thread(proc, stack, tf);
+
+    /* parent relationship and pid */
+    proc->parent = current;
+
+    /* allocate pid */
+    proc->pid = get_pid();
+
+    /* inherit flags from parent? (optional) */
+    proc->flags = current->flags;
+
+    /* set initial runs and state */
+    proc->runs = 0;
+    proc->state = PROC_UNINIT; /* 将在 wakeup_proc 中改为 RUNNABLE */
+
+    /* 5. insert into proc_list & hash_list */
+    /* insert into global proc_list */
+    list_add(&proc_list, &proc->list_link);
+
+    /* insert into hash list */
+    hash_proc(proc);
+
+    /* bump count */
+    nr_process++;
+
+    /* 6. wakeup_proc -> make RUNNABLE */
+    wakeup_proc(proc);
+
+    /* 7. set return value: child pid */
+    ret = proc->pid;
+
+    /* If it's a kernel thread (stack == 0), set need_resched maybe */
+    /* (kernel_thread already sets up epc to kernel entry function) */
 fork_out:
     return ret;
 
