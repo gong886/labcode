@@ -296,106 +296,108 @@ copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf)
     proc->context.sp = (uintptr_t)(proc->tf);
 }
 
-/* do_fork -     parent process for a new child process
- * @clone_flags: used to guide how to clone the child process
- * @stack:       the parent's user stack pointer. if stack==0, It means to fork a kernel thread.
- * @tf:          the trapframe info, which will be copied to child process's proc->tf
+/* do_fork - 创建一个新的子进程（线程）
+ * @clone_flags: 用于指示如何克隆子进程
+ * @stack:       父进程的用户态栈指针；若 stack==0，表示创建一个 kernel thread
+ * @tf:          trapframe 信息，将会复制到子进程的 proc->tf
  */
 int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
 {
     int ret = -E_NO_FREE_PROC;
     struct proc_struct *proc;
+
+    // 如果当前进程数达到上限，则无法 fork
     if (nr_process >= MAX_PROCESS)
     {
         goto fork_out;
     }
+
     ret = -E_NO_MEM;
-    // LAB4:EXERCISE2 2312005
+
     /*
-     * Some Useful MACROs, Functions and DEFINEs, you can use them in below implementation.
-     * MACROs or Functions:
-     *   alloc_proc:   create a proc struct and init fields (lab4:exercise1)
-     *   setup_kstack: alloc pages with size KSTACKPAGE as process kernel stack
-     *   copy_mm:      process "proc" duplicate OR share process "current"'s mm according clone_flags
-     *                 if clone_flags & CLONE_VM, then "share" ; else "duplicate"
-     *   copy_thread:  setup the trapframe on the  process's kernel stack top and
-     *                 setup the kernel entry point and stack of process
-     *   hash_proc:    add proc into proc hash_list
-     *   get_pid:      alloc a unique pid for process
-     *   wakeup_proc:  set proc->state = PROC_RUNNABLE
-     * VARIABLES:
-     *   proc_list:    the process set's list
-     *   nr_process:   the number of process set
+     * 有用的宏、函数和变量（可在下面实现中使用）：
+     * MACRO/函数：
+     *   alloc_proc:   创建并初始化一个 proc_struct（lab4:exercise1）
+     *   setup_kstack: 为子进程分配大小为 KSTACKPAGE 的 kernel stack
+     *   copy_mm:      根据 clone_flags 选择“复制”或“共享”父进程的 mm
+     *                 若 clone_flags & CLONE_VM，则为“共享”；否则为“复制”
+     *   copy_thread:  在子进程的 kernel stack 顶设置 trapframe，
+     *                 并设置 kernel 入口点和 kernel stack
+     *   hash_proc:    将 proc 插入进程哈希表
+     *   get_pid:      分配一个唯一的 pid
+     *   wakeup_proc:  将子进程状态设为 PROC_RUNNABLE
+     *
+     * 变量：
+     *   proc_list:    全局进程链表
+     *   nr_process:   当前进程总数
      */
 
-    //    1. call alloc_proc to allocate a proc_struct
-    //    2. call setup_kstack to allocate a kernel stack for child process
-    //    3. call copy_mm to dup OR share mm according clone_flag
-    //    4. call copy_thread to setup tf & context in proc_struct
-    //    5. insert proc_struct into hash_list && proc_list
-    //    6. call wakeup_proc to make the new child process RUNNABLE
-    //    7. set ret vaule using child proc's pid
-        /* 1. alloc_proc */
+    //    1. 调用 alloc_proc 分配子进程的 proc_struct
+    //    2. 调用 setup_kstack 分配 kernel stack
+    //    3. 调用 copy_mm 根据 clone_flag 复制或共享 mm
+    //    4. 调用 copy_thread 设置 trapframe 和上下文
+    //    5. 将新 proc_struct 插入 hash_list 和 proc_list
+    //    6. 调用 wakeup_proc 让子进程变为 RUNNABLE
+    //    7. 使用子进程 pid 作为返回值
+
+    // 1. 分配并初始化进程控制块
     proc = alloc_proc();
     if (proc == NULL) {
         goto fork_out;
     }
 
-    /* 2. setup_kstack */
-    if (setup_kstack(proc) < 0) {
-        ret = -E_NO_MEM;
+    // 2. 为新进程分配内核栈
+    if (setup_kstack(proc) != 0) {
         goto bad_fork_cleanup_proc;
     }
 
-    /* 3. copy_mm (share or duplicate mm) */
-    if (copy_mm(clone_flags, proc) < 0) {
-        ret = -E_NO_MEM;
+    // 3. 复制或共享父进程的内存管理结构
+    if (copy_mm(clone_flags, proc) != 0) {
         goto bad_fork_cleanup_kstack;
     }
 
-    /* 4. copy_thread: setup trapframe/context */
+    // 4. 复制线程上下文（trapframe + context）
     copy_thread(proc, stack, tf);
 
-    /* parent relationship and pid */
+    // 设置父进程
     proc->parent = current;
 
-    /* allocate pid */
-    proc->pid = get_pid();
+    // 关键步骤：更新 pid、插入链表、更新全局进程数
+    // ——需要关闭中断避免并发修改内核链表
+    bool flag;
+    local_intr_save(flag);
+    {
+        // 5-1. 分配唯一 PID
+        proc->pid = get_pid();
 
-    /* inherit flags from parent? (optional) */
-    proc->flags = current->flags;
+        // 5-2. 加入哈希表，便于根据 pid 查找
+        hash_proc(proc);
 
-    /* set initial runs and state */
-    proc->runs = 0;
-    proc->state = PROC_UNINIT; /* 将在 wakeup_proc 中改为 RUNNABLE */
+        // 5-3. 加入全局进程链表
+        list_add(&proc_list, &proc->list_link);
 
-    /* 5. insert into proc_list & hash_list */
-    /* insert into global proc_list */
-    list_add(&proc_list, &proc->list_link);
+        // 5-4. 增加全局进程数量
+        nr_process++;
+    }
+    local_intr_restore(flag);
 
-    /* insert into hash list */
-    hash_proc(proc);
-
-    /* bump count */
-    nr_process++;
-
-    /* 6. wakeup_proc -> make RUNNABLE */
+    // 6. 唤醒子进程，使其进入 RUNNABLE 状态
     wakeup_proc(proc);
 
-    /* 7. set return value: child pid */
+    // 7. 父进程返回子进程的 PID
     ret = proc->pid;
 
-    /* If it's a kernel thread (stack == 0), set need_resched maybe */
-    /* (kernel_thread already sets up epc to kernel entry function) */
 fork_out:
     return ret;
 
+// 错误处理路径
 bad_fork_cleanup_kstack:
     put_kstack(proc);
 bad_fork_cleanup_proc:
     kfree(proc);
     goto fork_out;
 }
+
 
 // do_exit - called by sys_exit
 //   1. call exit_mmap & put_pgdir & mm_destroy to free the almost all memory space of process
