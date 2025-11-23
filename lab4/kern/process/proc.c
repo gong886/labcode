@@ -185,44 +185,21 @@ get_pid(void)
 void proc_run(struct proc_struct *proc)
 {
     if (proc != current)
-    {
-        // LAB4:EXERCISE3 YOUR CODE
-        /*
-         * Some Useful MACROs, Functions and DEFINEs, you can use them in below implementation.
-         * MACROs or Functions:
-         *   local_intr_save():        Disable interrupts
-         *   local_intr_restore():     Enable Interrupts
-         *   lsatp():                   Modify the value of satp register
-         *   switch_to():              Context switching between two processes
-         */
-        // 保存中断状态并禁止中断
-        unsigned long irq_flag;
-        local_intr_save(irq_flag);
+    {   
+        bool intr_flag;
+        struct proc_struct *prev = current, *next = proc;
 
-        struct proc_struct *prev = current;
-
-        // 切换 current 指针到新的 proc
-        current = proc;
-
-        /*
-         * 加载进程的页表基地址到 satp (RISC-V)
-         * lsatp() 应该会把 proc->pgdir 写入 satp (你的环境中的实现)
-         */
-        lsatp(proc->pgdir);
-
-        /*
-         * 实际的上下文切换（会保存 old context 到 prev->context，
-         * 并恢复 proc->context）
-         */
-        switch_to(&prev->context, &proc->context);
-
-        // 还原中断状态
-        local_intr_restore(irq_flag);
-
-         
-
+        //禁用中断
+        local_intr_save(intr_flag);
+        {
+            current = proc;
+            lsatp(proc->pgdir);//切换页表
+            switch_to(&(prev->context), &(next->context));//进行上下文切换,之后代码执行流会跳转到next进程上次停止的地方或新进程的入口
+        }
+        local_intr_restore(intr_flag);//恢复中断状态
     }
 }
+
 
 // forkret -- the first kernel entry point of a new thread/process
 // NOTE: the addr of forkret is setted in copy_thread function
