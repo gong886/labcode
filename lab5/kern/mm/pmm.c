@@ -364,69 +364,107 @@ void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
         d0start = d1start;
     } while (d1start != 0 && d1start < end);
 }
-/* copy_range - copy content of memory (start, end) of one process A to another
- * process B
- * @to:    the addr of process B's Page Directory
- * @from:  the addr of process A's Page Directory
- * @share: flags to indicate to dup OR share. We just use dup method, so it
- * didn't be used.
+/* copy_range - 将进程 A 的用户态内存区间 [start, end)
+ *              按页复制到进程 B 中
+ * @to:    子进程的页目录地址
+ * @from:  父进程的页目录地址
+ * @start: 复制的起始虚拟地址（页对齐）
+ * @end:   复制的结束虚拟地址（页对齐）
+ * @share: 是否共享页面的标志位（本实验未使用，仅做深拷贝）
  *
- * CALL GRAPH: copy_mm-->dup_mmap-->copy_range
+ * 调用关系: copy_mm --> dup_mmap --> copy_range
  */
 int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,
                bool share)
 {
+    // 确保起始和结束地址都是页对齐的
     assert(start % PGSIZE == 0 && end % PGSIZE == 0);
+
+    // 确保复制的地址区间属于用户态地址空间
     assert(USER_ACCESS(start, end));
-    // copy content by page unit.
+
+    // 以页为单位，从 start 遍历到 end
     do
     {
-        // call get_pte to find process A's pte according to the addr start
+        // 根据当前虚拟地址 start，在父进程页表中查找对应的页表项
+        // ptep 指向父进程的 PTE
         pte_t *ptep = get_pte(from, start, 0), *nptep;
+
+        // 若父进程该地址对应的页表不存在
+        // 说明这一整段页表都不存在，直接跳到下一个页表区间
         if (ptep == NULL)
         {
             start = ROUNDDOWN(start + PTSIZE, PTSIZE);
             continue;
         }
-        // call get_pte to find process B's pte according to the addr start. If
-        // pte is NULL, just alloc a PT
+
+        // 若父进程该虚拟地址映射的页有效（存在物理页）
         if (*ptep & PTE_V)
         {
+            // 在子进程页表中为该虚拟地址获取/创建对应的页表项
             if ((nptep = get_pte(to, start, 1)) == NULL)
             {
+                // 子进程页表创建失败，返回内存不足错误
                 return -E_NO_MEM;
             }
+
+            // 继承父进程页表项中的用户态访问权限（U/R/W）
             uint32_t perm = (*ptep & PTE_USER);
-            // get page from ptep
+
+            // 根据父进程页表项，获取对应的物理页结构体
             struct Page *page = pte2page(*ptep);
-            // alloc a page for process B
+
+            // 为子进程分配一个新的物理页
             struct Page *npage = alloc_page();
+
+            // 父页和新页都必须有效
             assert(page != NULL);
             assert(npage != NULL);
+
+            // page_insert 的返回值
             int ret = 0;
             /* LAB5:EXERCISE2 YOUR CODE
-             * replicate content of page to npage, build the map of phy addr of
-             * nage with the linear addr start
-             *
-             * Some Useful MACROs and DEFINEs, you can use them in below
-             * implementation.
-             * MACROs or Functions:
-             *    page2kva(struct Page *page): return the kernel vritual addr of
-             * memory which page managed (SEE pmm.h)
-             *    page_insert: build the map of phy addr of an Page with the
-             * linear addr la
-             *    memcpy: typical memory copy function
-             *
-             * (1) find src_kvaddr: the kernel virtual address of page
-             * (2) find dst_kvaddr: the kernel virtual address of npage
-             * (3) memory copy from src_kvaddr to dst_kvaddr, size is PGSIZE
-             * (4) build the map of phy addr of  nage with the linear addr start
-             */
+            * 将父进程的物理页内容复制到子进程的新物理页中，
+            * 并建立新物理页与虚拟地址 start 之间的映射关系
+            *
+            * 以下是实现中可以使用的一些有用的宏和函数说明：
+            * 宏或函数：
+            *    page2kva(struct Page *page)：返回该 Page 所管理的物理内存
+            *    在内核中的虚拟地址（参见 pmm.h）
+            *    page_insert：在页表中建立一个 Page 的物理地址
+            *    与线性（虚拟）地址 la 之间的映射关系
+            *    memcpy：标准的内存拷贝函数
+            *
+            * 实现步骤提示：
+            * (1) 获取父进程物理页 page 对应的内核虚拟地址 src_kvaddr
+            * (2) 获取子进程新物理页 npage 对应的内核虚拟地址 dst_kvaddr
+            * (3) 将 src_kvaddr 中的内容复制到 dst_kvaddr，拷贝大小为 PGSIZE
+            * (4) 在子进程页表中建立新物理页 npage 与虚拟地址 start 的映射
+            */
+            // 获取父进程物理页对应的内核虚拟地址（源地址）
+            void *src_kvaddr = page2kva(page);
 
+            // 获取子进程新物理页对应的内核虚拟地址（目标地址）
+            void *dst_kvaddr = page2kva(npage);
+
+            // 将父进程页面的全部内容复制到子进程的新页面中
+            memcpy(dst_kvaddr, src_kvaddr, PGSIZE);
+
+            // 在子进程页表中建立：
+            // 虚拟地址 start -> 新物理页 npage 的映射
+            // 并设置相同的用户态访问权限
+            ret = page_insert(to, npage, start, perm);
+
+            // 确保页表映射建立成功
             assert(ret == 0);
         }
+
+        // 处理下一个虚拟页
         start += PGSIZE;
+
     } while (start != 0 && start < end);
+
+    // 所有页面复制完成
     return 0;
 }
 
