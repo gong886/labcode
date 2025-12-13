@@ -128,7 +128,7 @@ void interrupt_handler(struct trapframe *tf)
          * (4)判断打印次数，当打印次数为10时，调用<sbi.h>中的关机函数关机
          */
         clock_set_next_event();
-
+        current->need_resched = 1;
         static int printed_num = 0;
 
         // 递增 ticks 并检查是否达到阈值

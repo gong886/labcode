@@ -123,7 +123,9 @@ alloc_proc(void)
         proc->mm = NULL; // 内存管理结构
         proc->tf = NULL; // 中断帧指针
         memset(&(proc->context), 0, sizeof(struct context)); // 清空上下文
-        memset(proc->name, 0, PROC_NAME_LEN + 1);    // 清空进程名称      
+        memset(proc->name, 0, PROC_NAME_LEN + 1);    // 清空进程名称     
+        proc->wait_state = 0; // 初始化等待状态
+        proc->cptr = proc->optr = proc->yptr = NULL; // 初始化进程关系链表 
     }
     return proc;
 }
@@ -245,6 +247,7 @@ void proc_run(struct proc_struct *proc)
         {
             current = proc;
             lsatp(proc->pgdir);//切换页表
+            asm volatile("sfence.vma");
             switch_to(&(prev->context), &(next->context));//进行上下文切换,之后代码执行流会跳转到next进程上次停止的地方或新进程的入口
         }
         local_intr_restore(intr_flag);//恢复中断状态
@@ -487,6 +490,7 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
 
     // 设置父进程
     proc->parent = current;
+    assert(current->wait_state == 0);
 
     // 关键步骤：更新 pid、插入链表、更新全局进程数
     // ——需要关闭中断避免并发修改内核链表
@@ -495,15 +499,12 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
     {
         // 5-1. 分配唯一 PID
         proc->pid = get_pid();
-
         // 5-2. 加入哈希表，便于根据 pid 查找
         hash_proc(proc);
 
         // 5-3. 加入全局进程链表
-        list_add(&proc_list, &proc->list_link);
+        set_links(proc);
 
-        // 5-4. 增加全局进程数量
-        nr_process++;
     }
     local_intr_restore(flag);
 
@@ -610,7 +611,7 @@ load_icode(unsigned char *binary, size_t size)
         goto bad_pgdir_cleanup_mm;
     }
     //(3) copy TEXT/DATA section, build BSS parts in binary to memory space of process
-    struct Page *page;
+    struct Page *page=NULL;
     //(3.1) get the file header of the bianry program (ELF format)
     struct elfhdr *elf = (struct elfhdr *)binary;
     //(3.2) get the entry of the program section headers of the bianry program (ELF format)
@@ -736,9 +737,9 @@ load_icode(unsigned char *binary, size_t size)
     //(6) setup trapframe for user environment
     struct trapframe *tf = current->tf;
     // Keep sstatus
-    uintptr_t sstatus = tf->status;
+    uintptr_t sstatus = read_csr(sstatus);
     memset(tf, 0, sizeof(struct trapframe));
-    /* LAB5:EXERCISE1 YOUR CODE
+    /* LAB5:EXERCISE1 2312558
      * should set tf->gpr.sp, tf->epc, tf->status
      * NOTICE: If we set trapframe correctly, then the user level process can return to USER MODE from kernel. So
      *          tf->gpr.sp should be user stack top (the value of sp)
@@ -746,8 +747,13 @@ load_icode(unsigned char *binary, size_t size)
      *          tf->status should be appropriate for user program (the value of sstatus)
      *          hint: check meaning of SPP, SPIE in SSTATUS, use them by SSTATUS_SPP, SSTATUS_SPIE(defined in risv.h)
      */
+    
+    tf->gpr.sp = USTACKTOP;     // 用户栈指针指定为用户栈顶部
 
-    ret = 0;
+    
+    tf->epc = elf->e_entry;     // 程序入口点指定为ELF文件的入口地址
+
+    tf->status = (sstatus & ~SSTATUS_SPP) | SSTATUS_SPIE;   //清理SPP，置位 SPIE
 out:
     return ret;
 bad_cleanup_mmap:
