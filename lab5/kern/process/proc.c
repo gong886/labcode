@@ -524,65 +524,102 @@ bad_fork_cleanup_proc:
 }
 
 // do_exit - called by sys_exit
-//   1. call exit_mmap & put_pgdir & mm_destroy to free the almost all memory space of process
-//   2. set process' state as PROC_ZOMBIE, then call wakeup_proc(parent) to ask parent reclaim itself.
-//   3. call scheduler to switch to other process
+//   1. call exit_mmap & put_pgdir & mm_destroy to free the almost all memory space of process
+//   2. set process' state as PROC_ZOMBIE, then call wakeup_proc(parent) to ask parent reclaim itself.
+//   3. call scheduler to switch to other process
 int do_exit(int error_code)
 {
+    // 检查当前进程是否是 idleproc（空闲进程）
     if (current == idleproc)
     {
+        // idleproc 不应该退出，否则系统无法运行
         panic("idleproc exit.\n");
     }
+    // 检查当前进程是否是 initproc（初始进程/1 号进程）
     if (current == initproc)
     {
+        // initproc 也不应该退出，它负责回收孤儿进程和维护系统
         panic("initproc exit.\n");
     }
+    // 获取当前进程的内存管理结构
     struct mm_struct *mm = current->mm;
+    // 如果进程有内存管理结构（即非内核线程）
     if (mm != NULL)
     {
+        // 切换到内核页表（boot_pgdir_pa），因为即将释放用户内存，避免使用可能已被释放的用户页表进行寻址
         lsatp(boot_pgdir_pa);
+        // 对内存管理结构引用计数减一
         if (mm_count_dec(mm) == 0)
         {
+            // 如果引用计数归零，表示该 mm 结构不再被任何进程共享
+            // 释放所有用户态内存映射
             exit_mmap(mm);
+            // 释放页目录表（页表集合）
             put_pgdir(mm);
+            // 释放 mm 结构本身
             mm_destroy(mm);
         }
+        // 清空当前进程的 mm 字段，表示不再拥有内存管理结构
         current->mm = NULL;
     }
+    // 设置进程状态为僵尸（ZOMBIE），表示进程已终止，但其 PCB 尚未被父进程回收
     current->state = PROC_ZOMBIE;
+    // 保存进程的退出码
     current->exit_code = error_code;
+    
+    // 准备用于保存/恢复中断状态的变量
     bool intr_flag;
+    // 用于保存父进程或子进程的结构体指针
     struct proc_struct *proc;
+    // 保存当前中断状态并关闭中断（保证对进程列表/状态的原子操作）
     local_intr_save(intr_flag);
     {
+        // 获取当前进程的父进程
         proc = current->parent;
+        // 如果父进程正在等待子进程（wait_state == WT_CHILD）
         if (proc->wait_state == WT_CHILD)
         {
+            // 唤醒父进程，让它来回收当前这个僵尸子进程
             wakeup_proc(proc);
         }
+        // 处理当前进程的所有子进程（孤儿进程）
         while (current->cptr != NULL)
         {
+            // 获取第一个子进程
             proc = current->cptr;
+            // 将子进程从当前进程的子进程链表中断开（更新当前进程的子进程头指针）
             current->cptr = proc->optr;
 
+            // 清空子进程的 yptr（指向父进程子进程列表中的前一个进程）
             proc->yptr = NULL;
+            // 将该子进程加入到 initproc 的子进程链表头部
             if ((proc->optr = initproc->cptr) != NULL)
             {
+                // 如果 initproc 已经有子进程，则更新其 yptr 指针
                 initproc->cptr->yptr = proc;
             }
+            // 将子进程的父进程设置为 initproc（收养）
             proc->parent = initproc;
+            // 更新 initproc 的子进程头指针
             initproc->cptr = proc;
+            // 如果该子进程已经是僵尸状态（可能它比当前进程更早退出）
             if (proc->state == PROC_ZOMBIE)
             {
+                // 并且 initproc 正在等待子进程（wait_state == WT_CHILD）
                 if (initproc->wait_state == WT_CHILD)
                 {
+                    // 唤醒 initproc，让它回收这个僵尸子进程
                     wakeup_proc(initproc);
                 }
             }
         }
     }
+    // 恢复之前的中断状态
     local_intr_restore(intr_flag);
+    
+    // 调用调度器，切换到其他可运行进程
     schedule();
+    // 理论上 do_exit 不会返回，因为进程已经被切换出去了
     panic("do_exit will not return!! %d.\n", current->pid);
 }
 
@@ -767,45 +804,65 @@ bad_mm:
 }
 
 // do_execve - call exit_mmap(mm)&put_pgdir(mm) to reclaim memory space of current process
-//           - call load_icode to setup new memory space accroding binary prog.
+//           - call load_icode to setup new memory space accroding binary prog.
 int do_execve(const char *name, size_t len, unsigned char *binary, size_t size)
 {
+    // 获取当前进程的内存管理结构
     struct mm_struct *mm = current->mm;
+    // 检查用户空间提供的程序名地址是否有效且可读
     if (!user_mem_check(mm, (uintptr_t)name, len, 0))
     {
+        // 内存检查失败，返回无效参数错误
         return -E_INVAL;
     }
+    // 限制程序名长度，防止溢出
     if (len > PROC_NAME_LEN)
     {
         len = PROC_NAME_LEN;
     }
 
+    // 在内核栈上分配本地空间存储程序名
     char local_name[PROC_NAME_LEN + 1];
+    // 清空本地存储空间
     memset(local_name, 0, sizeof(local_name));
+    // 从用户空间复制程序名到内核空间
     memcpy(local_name, name, len);
 
+    // 如果进程有内存管理结构
     if (mm != NULL)
     {
         cputs("mm != NULL");
+        // 切换到内核页表，准备清理用户内存
         lsatp(boot_pgdir_pa);
+        // 对内存管理结构引用计数减一
         if (mm_count_dec(mm) == 0)
         {
+            // 引用计数归零，释放旧的用户内存空间
             exit_mmap(mm);
+            // 释放页目录表
             put_pgdir(mm);
+            // 释放 mm 结构本身
             mm_destroy(mm);
         }
+        // 清空当前进程的 mm 字段，准备加载新程序的内存
         current->mm = NULL;
     }
     int ret;
+    // 加载新的程序代码和数据，创建新的内存管理结构
     if ((ret = load_icode(binary, size)) != 0)
     {
+        // 加载失败，跳转到 execve_exit
         goto execve_exit;
     }
+    // 设置新的进程名
     set_proc_name(current, local_name);
+    // 成功执行，返回 0
     return 0;
 
 execve_exit:
+    // 如果加载失败，调用 do_exit 结束当前进程
     do_exit(ret);
+    // do_exit 不会返回，如果返回则出错了
     panic("already exit: %e.\n", ret);
 }
 
@@ -817,77 +874,117 @@ int do_yield(void)
 }
 
 // do_wait - wait one OR any children with PROC_ZOMBIE state, and free memory space of kernel stack
-//         - proc struct of this child.
+//         - proc struct of this child.
 // NOTE: only after do_wait function, all resources of the child proces are free.
 int do_wait(int pid, int *code_store)
 {
+    // 获取当前进程的内存管理结构
     struct mm_struct *mm = current->mm;
+    // 如果提供了存储退出码的地址
     if (code_store != NULL)
     {
+        // 检查用户空间提供的地址是否有效且可写
         if (!user_mem_check(mm, (uintptr_t)code_store, sizeof(int), 1))
         {
+            // 内存检查失败，返回无效参数错误
             return -E_INVAL;
         }
     }
 
+    // 进程结构体指针
     struct proc_struct *proc;
+    // 准备用于保存/恢复中断状态的变量 和 标记是否有子进程的变量
     bool intr_flag, haskid;
+
+// 循环点，可能会因等待子进程而被唤醒后再次检查
 repeat:
+    // 重置是否有子进程的标志
     haskid = 0;
+    // 如果 pid 不为 0，表示等待特定的子进程
     if (pid != 0)
     {
+        // 根据 pid 查找进程
         proc = find_proc(pid);
+        // 检查进程是否存在且其父进程是当前进程
         if (proc != NULL && proc->parent == current)
         {
+            // 确认有子进程
             haskid = 1;
+            // 如果子进程是僵尸状态
             if (proc->state == PROC_ZOMBIE)
             {
+                // 找到了要回收的子进程
                 goto found;
             }
         }
     }
+    // 如果 pid 为 0，表示等待任何一个僵尸子进程
     else
     {
+        // 从当前进程的子进程链表头开始遍历
         proc = current->cptr;
+        // 遍历所有子进程
         for (; proc != NULL; proc = proc->optr)
         {
+            // 确认有子进程
             haskid = 1;
+            // 如果子进程是僵尸状态
             if (proc->state == PROC_ZOMBIE)
             {
+                // 找到了要回收的子进程
                 goto found;
             }
         }
     }
+    // 检查是否有子进程（如果循环结束还没找到僵尸进程）
     if (haskid)
     {
+        // 设置当前进程状态为睡眠
         current->state = PROC_SLEEPING;
+        // 设置等待状态为等待子进程
         current->wait_state = WT_CHILD;
+        // 调用调度器，让出 CPU
         schedule();
+        // 如果被唤醒后发现自身被标记为退出中（如收到了信号）
         if (current->flags & PF_EXITING)
         {
+            // 进程自行退出，返回被杀死错误码
             do_exit(-E_KILLED);
         }
+        // 唤醒后，回到 repeat 再次检查是否有僵尸子进程
         goto repeat;
     }
+    // 如果没有子进程，返回错误码：坏进程或无子进程
     return -E_BAD_PROC;
 
+// 找到僵尸子进程后跳转到此
 found:
+    // 检查僵尸进程是否是 idleproc 或 initproc（理论上不应该）
     if (proc == idleproc || proc == initproc)
     {
         panic("wait idleproc or initproc.\n");
     }
+    // 如果提供了存储退出码的地址
     if (code_store != NULL)
     {
+        // 将子进程的退出码存入用户指定的地址
         *code_store = proc->exit_code;
     }
+    // 保存当前中断状态并关闭中断（保证对进程列表的原子操作）
     local_intr_save(intr_flag);
     {
+        // 从 PID 哈希表中移除子进程
         unhash_proc(proc);
+        // 从父子关系链表中移除子进程
         remove_links(proc);
     }
+    // 恢复之前的中断状态
     local_intr_restore(intr_flag);
+    // 释放子进程的内核栈
     put_kstack(proc);
+    // 释放子进程的 PCB 结构体
     kfree(proc);
+    // 成功回收，返回 0
     return 0;
 }
 
