@@ -153,7 +153,7 @@ alloc_proc(void)
         proc->lab6_stride = 0;
         proc->lab6_priority = 0;
         //lab8
-        struct files_struct * filesp;  // 文件结构指针
+        proc->filesp = NULL;
 
         
     }
@@ -284,7 +284,7 @@ void proc_run(struct proc_struct *proc)
         {
             current = proc;
             lsatp(proc->pgdir);//切换页表
-            // 刷新TLB , LAB8要求添加的
+            // 刷新TLB , LAB8
             flush_tlb();
             switch_to(&(prev->context), &(next->context));//进行上下文切换,之后代码执行流会跳转到next进程上次停止的地方或新进程的入口
         }
@@ -566,6 +566,11 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
         goto bad_fork_cleanup_proc;
     }
 
+    if (copy_files(clone_flags, proc) != 0)
+    { // for LAB8
+        goto bad_fork_cleanup_kstack;
+    }
+
     // 3. 复制或共享父进程的内存管理结构
     if (copy_mm(clone_flags, proc) != 0) {
         goto bad_fork_cleanup_kstack;
@@ -599,10 +604,7 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
 
     // 7. 父进程返回子进程的 PID
     ret = proc->pid;
-    if (copy_files(clone_flags, proc) != 0)
-    { // for LAB8
-        goto bad_fork_cleanup_kstack;
-    }
+
     
 fork_out:
     return ret;
@@ -726,7 +728,162 @@ load_icode(int fd, int argc, char **kargv)
      * (7) setup trapframe for user environment
      * (8) if up steps failed, you should cleanup the env.
      */
-    
+    // (1) 检查当前进程是否已有内存管理结构 mm
+    if (current->mm != NULL) {
+        panic("load_icode: current->mm must be NULL.\n");
+    }
+
+    int ret = -E_NO_MEM;
+    struct mm_struct *mm;
+    // (1) 为当前进程创建一个新的 mm
+    if ((mm = mm_create()) == NULL) {
+        goto bad_mm;
+    }
+
+    // (2) 创建一个新的页目录表 (PDT)
+    if (setup_pgdir(mm) != 0) {
+        goto bad_pgdir_cleanup_mm;
+    }
+
+    // (3) 解析 ELF 文件
+    struct elfhdr __elf, *elf = &__elf;
+    if ((ret = load_icode_read(fd, elf, sizeof(struct elfhdr), 0)) != 0) {
+        goto bad_elf_cleanup_pgdir;
+    }
+    if (elf->e_magic != ELF_MAGIC) {
+        ret = -E_INVAL_ELF;
+        goto bad_elf_cleanup_pgdir;
+    }
+
+    struct proghdr __ph, *ph = &__ph;
+    uint32_t vm_flags, perm;
+    for (int i = 0; i < elf->e_phnum; i++) {
+        off_t phoff = elf->e_phoff + sizeof(struct proghdr) * i;
+        if ((ret = load_icode_read(fd, ph, sizeof(struct proghdr), phoff)) != 0) {
+            goto bad_cleanup_mmap;
+        }
+        if (ph->p_type != ELF_PT_LOAD) {
+            continue;
+        }
+        if (ph->p_filesz > ph->p_memsz) {
+            ret = -E_INVAL_ELF;
+            goto bad_cleanup_mmap;
+        }
+        if (ph->p_memsz == 0) {
+            continue;
+        }
+
+        // --- 修正重点：权限位映射 ---
+        vm_flags = 0, perm = PTE_U | PTE_V;
+        if (ph->p_flags & ELF_PF_X) vm_flags |= VM_EXEC;
+        if (ph->p_flags & ELF_PF_W) vm_flags |= VM_WRITE;
+        if (ph->p_flags & ELF_PF_R) vm_flags |= VM_READ;
+        
+        // 关键：必须根据 ELF 段标志设置对应的 PTE 权限
+        if (vm_flags & VM_READ)  perm |= PTE_R;
+        if (vm_flags & VM_WRITE) perm |= (PTE_R | PTE_W);
+        if (vm_flags & VM_EXEC)  perm |= PTE_X; // 修复 Instruction page fault 的关键
+
+        // (3.3) 建立 VMA 映射
+        if ((ret = mm_map(mm, ph->p_va, ph->p_memsz, vm_flags, NULL)) != 0) {
+            goto bad_cleanup_mmap;
+        }
+
+        // (3.4) 分配物理内存并读取 TEXT/DATA 段
+        off_t offset = ph->p_offset;
+        size_t off, size;
+        uintptr_t start = ph->p_va, end = ph->p_va + ph->p_filesz;
+        uintptr_t la = ROUNDDOWN(start, PGSIZE);
+
+        struct Page *page;
+        while (la < end) {
+            if ((page = pgdir_alloc_page(mm->pgdir, la, perm)) == NULL) {
+                ret = -E_NO_MEM;
+                goto bad_cleanup_mmap;
+            }
+            off = (la < start) ? start - la : 0;
+            size = (ROUNDUP(la + 1, PGSIZE) > end) ? end - la - off : PGSIZE - off;
+            if ((ret = load_icode_read(fd, page2kva(page) + off, size, offset)) != 0) {
+                goto bad_cleanup_mmap;
+            }
+            la += PGSIZE;
+            offset += size;
+        }
+
+        // (3.5) 处理 BSS 段
+        end = ph->p_va + ph->p_memsz;
+        if (la < end) {
+            while (la < end) {
+                if ((page = pgdir_alloc_page(mm->pgdir, la, perm)) == NULL) {
+                    ret = -E_NO_MEM;
+                    goto bad_cleanup_mmap;
+                }
+                off = (la < start + ph->p_filesz) ? start + ph->p_filesz - la : 0;
+                size = (ROUNDUP(la + 1, PGSIZE) > end) ? end - la - off : PGSIZE - off;
+                memset(page2kva(page) + off, 0, size);
+                la += PGSIZE;
+            }
+        }
+    }
+    sysfile_close(fd);
+
+    // (4) 设置用户栈
+    vm_flags = VM_READ | VM_WRITE | VM_STACK;
+    if ((ret = mm_map(mm, USTACKTOP - USTACKSIZE, USTACKSIZE, vm_flags, NULL)) != 0) {
+        goto bad_cleanup_mmap;
+    }
+    // 分配用户栈顶部的物理页，权限使用 PTE_USER
+    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP - PGSIZE, PTE_USER) != NULL);
+    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP - 2 * PGSIZE, PTE_USER) != NULL);
+    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP - 3 * PGSIZE, PTE_USER) != NULL);
+    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP - 4 * PGSIZE, PTE_USER) != NULL);
+
+    // (5) 设置当前进程的 mm, cr3 并刷新 TLB
+    mm_count_inc(mm);
+    current->mm = mm;
+    current->pgdir = PADDR(mm->pgdir);
+    lsatp(current->pgdir);
+    flush_tlb();
+
+    // (6) 处理用户栈参数 (argc, argv)
+    uint32_t argv_size = 0;
+    for (int i = 0; i < argc; i++) {
+        argv_size += strnlen(kargv[i], EXEC_MAX_ARG_LEN) + 1;
+    }
+
+    uintptr_t stacktop = USTACKTOP - (ROUNDUP(argv_size, sizeof(long)) + ROUNDUP(argc * sizeof(char *), sizeof(long)));
+    char **uargv = (char **)(stacktop);
+    char *p = (char *)(stacktop + argc * sizeof(char *));
+
+    for (int i = 0; i < argc; i++) {
+        uargv[i] = p;
+        strcpy(p, kargv[i]);
+        p += strnlen(kargv[i], EXEC_MAX_ARG_LEN) + 1;
+    }
+
+    // (7) 初始化用户态中断帧
+    struct trapframe *tf = current->tf;
+    uintptr_t sstatus = tf->status; // 备份当前状态
+    memset(tf, 0, sizeof(struct trapframe));
+    tf->epc = elf->e_entry;       // 程序入口
+    tf->gpr.sp = stacktop;        // 用户栈顶
+    // 确保 SPP=0 (用户态) 且开启中断 SPIE=1
+    tf->status = (sstatus & ~SSTATUS_SPP) | SSTATUS_SPIE;
+    tf->gpr.a0 = argc;
+    tf->gpr.a1 = stacktop;
+
+    ret = 0;
+out:
+    return ret;
+
+bad_cleanup_mmap:
+    exit_mmap(mm);
+bad_elf_cleanup_pgdir:
+    put_pgdir(mm);
+bad_pgdir_cleanup_mm:
+    mm_destroy(mm);
+bad_mm:
+    goto out;
 }
 
 // this function isn't very correct in LAB8
